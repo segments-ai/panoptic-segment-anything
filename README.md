@@ -1,7 +1,7 @@
 # Zero-shot panoptic segmentation using SAM
 
-<a target="_blank" href="https://github.com/segments-ai/panoptic-segment-anything/blob/master/panoptic-segment-anything.ipynb">
-    <img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/>
+<a target="_blank" href="https://colab.research.google.com/github/segments-ai/panoptic-segment-anything/blob/master/panoptic-segment-anything.ipynb">
+  <img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/>
 </a>
 
 This is a proof of concept for zero-shot panoptic segmentation using the [Segment Anything Model (SAM)](https://github.com/facebookresearch/segment-anything). 
