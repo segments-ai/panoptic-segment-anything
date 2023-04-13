@@ -1,3 +1,4 @@
+accelerate
 addict
 diffusers
 gradio
@@ -18,5 +19,8 @@ torch
 torchvision
 transformers
 yapf
+segment_anything
+scikit-image
 segments-ai
-scipy
+--extra-index-url https://download.pytorch.org/whl/cu113
+torch

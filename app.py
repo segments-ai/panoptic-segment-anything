@@ -1,12 +1,7 @@
 import subprocess, os, sys
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-
 result = subprocess.run(["pip", "install", "-e", "GroundingDINO"], check=True)
 print(f"pip install GroundingDINO = {result}")
-
-result = subprocess.run(["pip", "list"], check=True)
-print(f"pip list = {result}")
 
 sys.path.insert(0, "./GroundingDINO")
 
@@ -44,9 +39,8 @@ from GroundingDINO.groundingdino.util import box_ops
 from GroundingDINO.groundingdino.util.slconfig import SLConfig
 from GroundingDINO.groundingdino.util.utils import (
     clean_state_dict,
-    get_phrases_from_posmap,
 )
-from GroundingDINO.groundingdino.util.inference import annotate, load_image, predict
+from GroundingDINO.groundingdino.util.inference import annotate, predict
 
 # segment anything
 from segment_anything import build_sam, SamPredictor
@@ -55,20 +49,8 @@ from segment_anything import build_sam, SamPredictor
 from transformers import CLIPSegProcessor, CLIPSegForImageSegmentation
 
 
-def get_device():
-    from numba import cuda
-
-    if cuda.is_available():
-        device = "cuda:0"  # cuda.get_current_device()
-    else:
-        device = "cpu"
-    return device
-
-
-def load_model_hf(repo_id, filename, ckpt_config_filename, device="cpu"):
-    cache_config_file = hf_hub_download(repo_id=repo_id, filename=ckpt_config_filename)
-
-    args = SLConfig.fromfile(cache_config_file)
+def load_model_hf(model_config_path, repo_id, filename, device):
+    args = SLConfig.fromfile(model_config_path)
     model = build_model(args)
     args.device = device
 
@@ -77,6 +59,7 @@ def load_model_hf(repo_id, filename, ckpt_config_filename, device="cpu"):
     log = model.load_state_dict(clean_state_dict(checkpoint["model"]), strict=False)
     print("Model loaded from {} \n => {}".format(cache_file, log))
     _ = model.eval()
+    model = model.to(device)
     return model
 
 
@@ -113,10 +96,8 @@ def dino_detection(
             caption=detection_prompt,
             box_threshold=box_threshold,
             text_threshold=text_threshold,
+            device=device,
         )
-    logits = logits.cpu()
-    boxes = boxes.cpu()
-    phrases = phrases.cpu()
     category_ids = [category_name_to_id[phrase] for phrase in phrases]
 
     if visualize:
@@ -130,13 +111,13 @@ def dino_detection(
         return boxes, category_ids
 
 
-def sam_masks_from_dino_boxes(predictor, image_array, boxes):
+def sam_masks_from_dino_boxes(predictor, image_array, boxes, device):
     # box: normalized box xywh -> unnormalized xyxy
     H, W, _ = image_array.shape
     boxes_xyxy = box_ops.box_cxcywh_to_xyxy(boxes) * torch.Tensor([W, H, W, H])
     transformed_boxes = predictor.transform.apply_boxes_torch(
         boxes_xyxy, image_array.shape[:2]
-    )
+    ).to(device)
     thing_masks, _, _ = predictor.predict_torch(
         point_coords=None,
         point_labels=None,
@@ -301,17 +282,6 @@ def generate_panoptic_mask(
     image = image.convert("RGB")
     image_array = np.asarray(image)
 
-    groundingdino_device = "cpu"
-    if device != "cpu":
-        try:
-            from GroundingDINO.groundingdino import _C
-
-            groundingdino_device = "cuda:0"
-        except:
-            warnings.warn(
-                "Failed to load custom C++ ops. Running on CPU mode Only in groundingdino!"
-            )
-
     # detect boxes for "thing" categories using Grounding DINO
     thing_boxes, _ = dino_detection(
         dino_model,
@@ -321,12 +291,14 @@ def generate_panoptic_mask(
         category_name_to_id,
         dino_box_threshold,
         dino_text_threshold,
-        groundingdino_device,
+        device,
     )
     # compute SAM image embedding
     sam_predictor.set_image(image_array)
     # get segmentation masks for the thing boxes
-    thing_masks = sam_masks_from_dino_boxes(sam_predictor, image_array, thing_boxes)
+    thing_masks = sam_masks_from_dino_boxes(
+        sam_predictor, image_array, thing_boxes, device
+    )
     # get rough segmentation masks for "stuff" categories using CLIPSeg
     clipseg_preds, clipseg_semantic_inds = clipseg_segmentation(
         clipseg_processor,
@@ -371,36 +343,46 @@ def generate_panoptic_mask(
         # overlay thing mask on panoptic inds
         panoptic_inds[thing_mask.squeeze()] = ind
         ind += 1
-    return panoptic_inds
+
+    fig = plt.figure()
+    plt.imshow(image)
+    plt.imshow(colorize(panoptic_inds), alpha=0.5)
+    return fig
 
 
+config_file = "GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py"
 ckpt_repo_id = "ShilongLiu/GroundingDINO"
-ckpt_filename = "groundingdino_swinb_cogcoor.pth"
-ckpt_config_filename = "GroundingDINO_SwinB.cfg.py"
-
+ckpt_filename = "groundingdino_swint_ogc.pth"
 sam_checkpoint = "./sam_vit_h_4b8939.pth"
-output_dir = "outputs"
-device = "cuda"
 
-device = get_device()
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print("Using device:", device)
 
-print(f"device={device}")
+if device != "cpu":
+    try:
+        from GroundingDINO.groundingdino import _C
+    except:
+        warnings.warn(
+            "Failed to load custom C++ ops. Running on CPU mode Only in groundingdino!"
+        )
 
 # initialize groundingdino model
-dino_model = load_model_hf(ckpt_repo_id, ckpt_filename, ckpt_config_filename, device)
-dino_model = dino_model.to(device)
+dino_model = load_model_hf(config_file, ckpt_repo_id, ckpt_filename, device)
 
 # initialize SAM
-sam_predictor = SamPredictor(build_sam(checkpoint=sam_checkpoint))
+sam = build_sam(checkpoint=sam_checkpoint)
+sam.to(device=device)
+sam_predictor = SamPredictor(sam)
 
 clipseg_processor = CLIPSegProcessor.from_pretrained("CIDAS/clipseg-rd64-refined")
 clipseg_model = CLIPSegForImageSegmentation.from_pretrained(
     "CIDAS/clipseg-rd64-refined"
 )
+clipseg_model.to(device)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser("Grounded SAM demo", add_help=True)
+    parser = argparse.ArgumentParser("Panoptic Segment Anything demo", add_help=True)
     parser.add_argument("--debug", action="store_true", help="using debug mode")
     parser.add_argument("--share", action="store_true", help="share the app")
     args = parser.parse_args()
@@ -459,9 +441,7 @@ if __name__ == "__main__":
                     )
 
             with gr.Column():
-                gallery = gr.outputs.Image(
-                    type="pil",
-                ).style(full_width=True, full_height=True)
+                plot = gr.Plot()
 
         run_button.click(
             fn=generate_panoptic_mask,
@@ -475,12 +455,7 @@ if __name__ == "__main__":
                 shrink_kernel_size,
                 num_samples_factor,
             ],
-            outputs=[gallery],
+            outputs=[plot],
         )
-        # task_type.change(fn=change_task_type, inputs=[task_type], outputs=[inpaint_prompt])
-
-        DESCRIPTION = "### This demo from [Grounded-Segment-Anything](https://github.com/IDEA-Research/Grounded-Segment-Anything). Thanks for their excellent work."
-        DESCRIPTION += f'<p>For faster inference without waiting in queue, you may duplicate the space and upgrade to GPU in settings. <a href="https://huggingface.co/spaces/yizhangliu/Grounded-Segment-Anything?duplicate=true"><img style="display: inline; margin-top: 0em; margin-bottom: 0em" src="https://bit.ly/3gLdBN6" alt="Duplicate Space" /></a></p>'
-        gr.Markdown(DESCRIPTION)
 
     block.launch(server_name="0.0.0.0", debug=args.debug, share=args.share)
