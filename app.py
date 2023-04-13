@@ -143,13 +143,15 @@ def preds_to_semantic_inds(preds, threshold):
     return semantic_inds
 
 
-def clipseg_segmentation(processor, model, image, category_names, background_threshold):
+def clipseg_segmentation(
+    processor, model, image, category_names, background_threshold, device
+):
     inputs = processor(
         text=category_names,
         images=[image] * len(category_names),
         padding="max_length",
         return_tensors="pt",
-    )
+    ).to(device)
     with torch.no_grad():
         outputs = model(**inputs)
     # resize the outputs
@@ -183,7 +185,7 @@ def clip_and_shrink_preds(semantic_inds, preds, shrink_kernel_size, num_categori
     # convert semantic_inds to shrunken bool masks
     bool_masks = semantic_inds_to_shrunken_bool_masks(
         semantic_inds, shrink_kernel_size, num_categories
-    )
+    ).to(preds.device)
 
     sizes = [
         torch.sum(bool_masks[i].int()).item() for i in range(1, bool_masks.size(0))
@@ -306,6 +308,7 @@ def generate_panoptic_mask(
         image,
         stuff_category_names,
         segmentation_background_threshold,
+        device,
     )
     # remove things from stuff masks
     combined_things_mask = torch.any(thing_masks, dim=0)
@@ -327,7 +330,7 @@ def generate_panoptic_mask(
         num_samples = int(relative_sizes[i] * num_samples_factor)
         if num_samples == 0:
             continue
-        points = sample_points_based_on_preds(clipseg_pred.numpy(), num_samples)
+        points = sample_points_based_on_preds(clipseg_pred.cpu().numpy(), num_samples)
         if len(points) == 0:
             continue
         # use SAM to get mask for points
@@ -380,6 +383,16 @@ clipseg_model = CLIPSegForImageSegmentation.from_pretrained(
 )
 clipseg_model.to(device)
 
+
+title = "Interactive demo: panoptic segment anything"
+description = "Demo for zero-shot panoptic segmentation using Segment Anything, Grounding DINO, and CLIPSeg. To use it, simply upload an image and add a text to mask (identify in the image), or use one of the examples below and click 'submit'."
+article = "<p style='text-align: center'><a href='https://github.com/segments-ai/panoptic-segment-anything'>Github</a></p>"
+
+examples = [
+    ["a2d2.png", "car, bus, person", "road, sky, buildings", 0.3, 0.25, 0.1, 20, 1000],
+    ["dogs.png", "dog, wooden stick", "sky, sand"],
+    ["bxl.png", "car, tram, motorcycle, person", "road, buildings, sky"],
+]
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("Panoptic Segment Anything demo", add_help=True)
