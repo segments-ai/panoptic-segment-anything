@@ -3,6 +3,9 @@ import subprocess, os, sys
 result = subprocess.run(["pip", "install", "-e", "GroundingDINO"], check=True)
 print(f"pip install GroundingDINO = {result}")
 
+result = subprocess.run(["pip", "install", "gradio==3.27.0"], check=True)
+print(f"pip install gradio==3.27.0 = {result}")
+
 sys.path.insert(0, "./GroundingDINO")
 
 if not os.path.exists("./sam_vit_h_4b8939.pth"):
@@ -173,8 +176,10 @@ def semantic_inds_to_shrunken_bool_masks(
     bool_masks = torch.zeros((num_categories, *semantic_inds.shape), dtype=bool)
     for category in range(num_categories):
         binary_mask = semantic_inds == category
-        shrunken_binary_mask_array = ndimage.binary_erosion(
-            binary_mask.numpy(), structure=shrink_kernel
+        shrunken_binary_mask_array = (
+            ndimage.binary_erosion(binary_mask.numpy(), structure=shrink_kernel)
+            if shrink_kernel_size > 0
+            else binary_mask.numpy()
         )
         bool_masks[category] = torch.from_numpy(shrunken_binary_mask_array)
 
@@ -285,7 +290,7 @@ def generate_panoptic_mask(
     image_array = np.asarray(image)
 
     # detect boxes for "thing" categories using Grounding DINO
-    thing_boxes, _ = dino_detection(
+    thing_boxes, category_ids = dino_detection(
         dino_model,
         image,
         image_array,
@@ -347,10 +352,22 @@ def generate_panoptic_mask(
         panoptic_inds[thing_mask.squeeze()] = ind
         ind += 1
 
-    fig = plt.figure()
-    plt.imshow(image)
-    plt.imshow(colorize(panoptic_inds), alpha=0.5)
-    return fig
+    panoptic_bool_masks = (
+        semantic_inds_to_shrunken_bool_masks(panoptic_inds, 0, ind + 1)
+        .numpy()
+        .astype(int)
+    )
+    panoptic_names = (
+        ["background"]
+        + stuff_category_names
+        + [category_names[category_id] for category_id in category_ids]
+    )
+    subsection_label_pairs = [
+        (panoptic_bool_masks[i], panoptic_name)
+        for i, panoptic_name in enumerate(panoptic_names)
+    ]
+
+    return (image_array, subsection_label_pairs)
 
 
 config_file = "GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py"
@@ -450,7 +467,7 @@ if __name__ == "__main__":
                         )
 
                 with gr.Column():
-                    plot = gr.Plot()
+                    annotated_image = gr.AnnotatedImage()
 
             examples = gr.Examples(
                 examples=[
@@ -486,7 +503,7 @@ if __name__ == "__main__":
                     shrink_kernel_size,
                     num_samples_factor,
                 ],
-                outputs=[plot],
+                outputs=[annotated_image],
                 cache_examples=True,
             )
 
@@ -502,7 +519,7 @@ if __name__ == "__main__":
                 shrink_kernel_size,
                 num_samples_factor,
             ],
-            outputs=[plot],
+            outputs=[annotated_image],
         )
 
     block.launch(server_name="0.0.0.0", debug=args.debug, share=args.share)
