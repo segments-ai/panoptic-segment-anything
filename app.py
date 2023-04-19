@@ -18,21 +18,20 @@ if not os.path.exists("./sam_vit_h_4b8939.pth"):
     )
     print(f"wget sam_vit_h_4b8939.pth result = {result}")
 
-import gradio as gr
 
 import argparse
 import random
 import warnings
+import json
 
+import gradio as gr
 import numpy as np
-import matplotlib.pyplot as plt
 import torch
 from torch import nn
 import torch.nn.functional as F
 from scipy import ndimage
 from PIL import Image
 from huggingface_hub import hf_hub_download
-from segments.export import colorize
 from segments.utils import bitmap2file
 
 # Grounding DINO
@@ -111,7 +110,7 @@ def dino_detection(
         visualization = Image.fromarray(annotated_frame)
         return boxes, category_ids, visualization
     else:
-        return boxes, category_ids
+        return boxes, category_ids, phrases
 
 
 def sam_masks_from_dino_boxes(predictor, image_array, boxes, device):
@@ -262,6 +261,33 @@ def sam_mask_from_points(predictor, image_array, points):
     return upsampled_pred
 
 
+def inds_to_segments_format(
+    panoptic_inds, thing_category_ids, stuff_category_names, category_name_to_id
+):
+    panoptic_inds_array = panoptic_inds.numpy().astype(np.uint32)
+    bitmap_file = bitmap2file(panoptic_inds_array, is_segmentation_bitmap=True)
+    segmentation_bitmap = Image.open(bitmap_file)
+
+    stuff_category_ids = [
+        category_name_to_id[stuff_category_name]
+        for stuff_category_name in stuff_category_names
+    ]
+
+    unique_inds = np.unique(panoptic_inds_array)
+    stuff_annotations = [
+        {"id": i, "category_id": stuff_category_ids[i - 1]}
+        for i in range(1, len(stuff_category_names) + 1)
+        if i in unique_inds
+    ]
+    thing_annotations = [
+        {"id": len(stuff_category_names) + 1 + i, "category_id": thing_category_id}
+        for i, thing_category_id in enumerate(thing_category_ids)
+    ]
+    annotations = stuff_annotations + thing_annotations
+
+    return segmentation_bitmap, annotations
+
+
 def generate_panoptic_mask(
     image,
     thing_category_names_string,
@@ -271,26 +297,49 @@ def generate_panoptic_mask(
     segmentation_background_threshold=0.1,
     shrink_kernel_size=20,
     num_samples_factor=1000,
+    task_attributes_json="",
 ):
-    # parse inputs
-    thing_category_names = [
-        thing_category_name.strip()
-        for thing_category_name in thing_category_names_string.split(",")
-    ]
-    stuff_category_names = [
-        stuff_category_name.strip()
-        for stuff_category_name in stuff_category_names_string.split(",")
-    ]
-    category_names = thing_category_names + stuff_category_names
-    category_name_to_id = {
-        category_name: i for i, category_name in enumerate(category_names)
-    }
+    if task_attributes_json != "":
+        task_attributes = json.loads(task_attributes_json)
+        categories = task_attributes["categories"]
+        category_name_to_id = {
+            category["name"]: category["id"] for category in categories
+        }
+        # split the categories into "stuff" categories (regions w/o instances)
+        # and "thing" categories (objects/instances)
+        stuff_categories = [
+            category
+            for category in categories
+            if "has_instances" not in category or not category["has_instances"]
+        ]
+        thing_categories = [
+            category
+            for category in categories
+            if "has_instances" in category and category["has_instances"]
+        ]
+        stuff_category_names = [category["name"] for category in stuff_categories]
+        thing_category_names = [category["name"] for category in thing_categories]
+        category_names = thing_category_names + stuff_category_names
+    else:
+        # parse inputs
+        thing_category_names = [
+            thing_category_name.strip()
+            for thing_category_name in thing_category_names_string.split(",")
+        ]
+        stuff_category_names = [
+            stuff_category_name.strip()
+            for stuff_category_name in stuff_category_names_string.split(",")
+        ]
+        category_names = thing_category_names + stuff_category_names
+        category_name_to_id = {
+            category_name: i for i, category_name in enumerate(category_names)
+        }
 
     image = image.convert("RGB")
     image_array = np.asarray(image)
 
     # detect boxes for "thing" categories using Grounding DINO
-    thing_boxes, category_ids = dino_detection(
+    thing_boxes, thing_category_ids, detected_thing_category_names = dino_detection(
         dino_model,
         image,
         image_array,
@@ -358,16 +407,19 @@ def generate_panoptic_mask(
         .astype(int)
     )
     panoptic_names = (
-        ["background"]
-        + stuff_category_names
-        + [category_names[category_id] for category_id in category_ids]
+        ["unlabeled"] + stuff_category_names + detected_thing_category_names
     )
     subsection_label_pairs = [
         (panoptic_bool_masks[i], panoptic_name)
         for i, panoptic_name in enumerate(panoptic_names)
     ]
 
-    return (image_array, subsection_label_pairs)
+    segmentation_bitmap, annotations = inds_to_segments_format(
+        panoptic_inds, thing_category_ids, stuff_category_names, category_name_to_id
+    )
+    annotations_json = json.dumps(annotations)
+
+    return (image_array, subsection_label_pairs), segmentation_bitmap, annotations_json
 
 
 config_file = "GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py"
@@ -445,7 +497,7 @@ if __name__ == "__main__":
                             step=0.001,
                         )
                         segmentation_background_threshold = gr.Slider(
-                            label="Segmentation background threshold (under this threshold, a pixel is considered background)",
+                            label="Segmentation background threshold (under this threshold, a pixel is considered background/unlabeled)",
                             minimum=0.0,
                             maximum=1.0,
                             value=0.1,
@@ -465,9 +517,27 @@ if __name__ == "__main__":
                             value=1000,
                             step=1,
                         )
+                        task_attributes_json = gr.Textbox(
+                            label="Task attributes JSON",
+                        )
 
                 with gr.Column():
                     annotated_image = gr.AnnotatedImage()
+                    with gr.Accordion("Segmentation bitmap", open=False):
+                        segmentation_bitmap_text = gr.Markdown(
+                            """
+The segmentation bitmap is a 32-bit RGBA png image which contains the segmentation masks.
+The alpha channel is set to 255, and the remaining 24-bit values in the RGB channels correspond to the object ids in the annotations list.
+Unlabeled regions have a value of 0.
+Because of the large dynamic range, the segmentation bitmap appears black in the image viewer.
+"""
+                        )
+                        segmentation_bitmap = gr.Image(
+                            type="pil", label="Segmentation bitmap"
+                        )
+                        annotations_json = gr.Textbox(
+                            label="Annotations JSON",
+                        )
 
             examples = gr.Examples(
                 examples=[
@@ -475,21 +545,11 @@ if __name__ == "__main__":
                         "a2d2.png",
                         "car, bus, person",
                         "road, sky, buildings, sidewalk",
-                        0.3,
-                        0.25,
-                        0.1,
-                        20,
-                        1000,
                     ],
                     [
                         "bxl.png",
                         "car, tram, motorcycle, person",
                         "road, buildings, sky",
-                        0.3,
-                        0.25,
-                        0.1,
-                        20,
-                        1000,
                     ],
                 ],
                 fn=generate_panoptic_mask,
@@ -497,13 +557,8 @@ if __name__ == "__main__":
                     input_image,
                     thing_category_names_string,
                     stuff_category_names_string,
-                    box_threshold,
-                    text_threshold,
-                    segmentation_background_threshold,
-                    shrink_kernel_size,
-                    num_samples_factor,
                 ],
-                outputs=[annotated_image],
+                outputs=[annotated_image, segmentation_bitmap, annotations_json],
                 cache_examples=True,
             )
 
@@ -518,8 +573,10 @@ if __name__ == "__main__":
                 segmentation_background_threshold,
                 shrink_kernel_size,
                 num_samples_factor,
+                task_attributes_json,
             ],
-            outputs=[annotated_image],
+            outputs=[annotated_image, segmentation_bitmap, annotations_json],
+            api_name="segment",
         )
 
     block.launch(server_name="0.0.0.0", debug=args.debug, share=args.share)
