@@ -3,9 +3,6 @@ import subprocess, os, sys
 result = subprocess.run(["pip", "install", "-e", "GroundingDINO"], check=True)
 print(f"pip install GroundingDINO = {result}")
 
-result = subprocess.run(["pip", "install", "gradio==3.27.0"], check=True)
-print(f"pip install gradio==3.27.0 = {result}")
-
 sys.path.insert(0, "./GroundingDINO")
 
 if not os.path.exists("./sam_vit_h_4b8939.pth"):
@@ -99,6 +96,7 @@ def dino_detection(
             box_threshold=box_threshold,
             text_threshold=text_threshold,
             device=device,
+            remove_combined=True
         )
     category_ids = [category_name_to_id[phrase] for phrase in phrases]
 
@@ -490,7 +488,7 @@ if __name__ == "__main__":
             )
             with gr.Row():
                 with gr.Column():
-                    input_image = gr.Image(source="upload", type="pil")
+                    input_image = gr.Image(sources=["upload"], type="pil")
                     thing_category_names_string = gr.Textbox(
                         label="Thing categories (i.e. categories with instances), comma-separated",
                         placeholder="E.g. car, bus, person",
@@ -499,7 +497,7 @@ if __name__ == "__main__":
                         label="Stuff categories (i.e. categories without instances), comma-separated",
                         placeholder="E.g. sky, road, buildings",
                     )
-                    run_button = gr.Button(label="Run")
+                    run_button = gr.Button(value="Run")
                     with gr.Accordion("Advanced options", open=False):
                         box_threshold = gr.Slider(
                             label="Grounding DINO box threshold",
